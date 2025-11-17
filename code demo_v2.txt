@@ -1,0 +1,184 @@
+.model small
+.stack 100h
+.data
+    ; Dia chi 8255A
+    PORTA EQU 20h
+    PORTB EQU 21h
+    PORTC EQU 22h
+    CTRL  EQU 23h
+    
+    ; Dia chi 8251A
+    UART_CMD  EQU 25h
+    UART_DATA EQU 24h
+
+    msg1 db 'Temp: $'
+    msg2 db 'C, $' ; 
+    alarm db 'ALARM!',13,10,'$'
+    okmsg db 'OK',13,10,'$'
+    
+    ; --- YEU CAU: Dieu chinh nguong ---
+    ; Nguong cu la 40. Vi code da nhan doi gia tri 'temp' (ADC_val * 2)
+    ; nen nguong cung phai nhan doi (40 * 2 = 80) de phep so sanh tuong duong.
+    threshold db 80  ; Nguong canh bao
+    
+    temp db ?
+
+.code
+main proc
+    mov ax, @data
+    mov ds, ax
+
+    ; Cau hinh 8255A
+    mov dx, CTRL
+    mov al, 91h
+    out dx, al
+
+    ; Cau hinh UART 8251A
+    mov dx, UART_CMD
+    mov al, 40h       ; Reset 8251A
+    out dx, al
+    
+    ; --- YEU CAU: Sua cau hinh UART ---
+    ; 4Eh = 01001110b
+    ; D7,D6=01 (1 stop bit)
+    ; D5,D4=00 (No parity)
+    ; D3,D2=11 (8 bit data)
+    ; D1,D0=10 (16x baud rate)
+    ; Day la cau hinh cho "8N1, 16x"
+    mov al, 4Eh       ; Thay vi 37h hay 0C6h
+    out dx, al
+    
+    mov al, 05h       ; Enable Tx + Rx
+    out dx, al
+
+loop_main:
+    ; ---- Bat dau qua trinh doc ADC0808 ----
+    
+    ; 1. Chon kenh IN0
+    mov dx, PORTB
+    mov al, 00h       ; Chon kenh 0 & START=0
+    out dx, al
+
+    ; 2. Tao xung START/ALE
+    mov al, 08h       ; PB3 = 1 (START/ALE high)
+    out dx, al
+    mov al, 00h       ; PB3 = 0 (START/ALE low)
+    out dx, al
+    
+    ; 3. Cho EOC (PC0)
+    mov dx, PORTC
+wait_eoc:
+    in al, dx         
+    test al, 01h      ; Kiem tra bit 0 (PC0)
+    jnz wait_eoc       
+    
+    ; 4. Doc gia tri 8-bit tu ADC
+    mov dx, PORTA
+    in al, dx
+    
+    ; --- YEU CAU: Thuc hien Ty le Nhiet do (Xap xi x2) ---
+    ; Day la xap xi T = D * 2.
+    ; LUU Y: Phep toan nay co the bi tran so (overflow)
+    ; neu gia tri ADC doc ve > 127.
+    shl al, 1         ; Nhan doi gia tri (ADC_val * 2)
+    mov [temp], al    ; Luu gia tri da nhan doi
+
+    ; ---- Gui Temp:  ra UART ----
+    lea si, msg1
+tx_msg1:
+    lodsb
+    cmp al,'$'
+    je print_temp
+    call tx_char
+    jmp tx_msg1
+
+print_temp:
+    ; Chuyen doi so 2 chu so sang ASCII
+    ; (Se in gia tri da * 2)
+    mov al,[temp]
+    mov ah,0
+    mov bl,10
+    div bl
+    add al,'0'
+    call tx_char
+    mov al,ah
+    add al,'0'
+    call tx_char
+    
+    lea si,msg2
+tx_unit:
+    lodsb
+    cmp al,'$'
+    je check_alarm   
+    call tx_char
+    jmp tx_unit
+
+; -----------------------------------------------------------------
+; Logic kiem tra ALARM da sua
+; -----------------------------------------------------------------
+check_alarm:
+    mov   al, [temp]        ; Lay gia tri da xap xi (ADC_val * 2)
+    cmp   al, [threshold]   ; So sanh voi nguong moi (80)
+    jbe   ok_status         ; Neu (ADC*2) <= 80, nhay den OK
+
+; ---- TRUONG HOP QUA NGUONG (temp > threshold) ----
+    ; 1. Bat LED (khong anh huong bit khac)
+    mov   dx, PORTC       
+    ; --- YEU CAU: Nang cao Kiem soat LED (Bat) ---
+    in    al, dx          ; Doc gia tri hien tai cua PortC
+    or    al, 10h         ; Bat bit 4 (0001 0000)
+    out   dx, al          ; Ghi gia tri moi
+    
+    ; 2. Gui thong bao 'ALARM'
+    lea si, alarm
+send_alarm:
+    lodsb
+    cmp al,'$'
+    je delay_loop         ; Da in xong, di den phan delay
+    call tx_char
+    jmp send_alarm
+
+ok_status:
+; ---- TRUONG HOP BINH THUONG (temp <= threshold) ----
+    ; 1. Tat LED (khong anh huong bit khac)
+    mov   dx, PORTC
+    ; --- YEU CAU: Nang cao Kiem soat LED (Tat) ---
+    in    al, dx          ; Doc gia tri hien tai cua PortC
+    and   al, 0EFh        ; Xoa bit 4 (AND voi 1110 1111)
+    out   dx, al          ; Ghi gia tri moi
+    
+    ; 2. Gui thong bao 'OK'
+    lea si, okmsg
+send_ok:
+    lodsb
+    cmp al,'$'
+    je delay_loop         ; Da in xong, di den phan delay
+    call tx_char
+    jmp send_ok
+
+delay_loop:
+    ; Tao tre cho vong lap chinh
+    mov cx,0FFFFh
+d1: loop d1
+    jmp loop_main
+
+main endp 
+
+; ---- Ham con: Truyen 1 ky tu qua UART (Da sua loi) ----
+tx_char proc
+    ; 'al' da chua ky tu can gui
+    push ax           
+    
+    mov dx, UART_CMD  
+wait_tx:
+    in al, dx         
+    test al, 01h      ; Kiem tra bit 0 (TxRDY)
+    jz wait_tx        
+    
+    pop ax            
+    mov dx, UART_DATA 
+    out dx, al        
+    ret
+tx_char endp
+
+end main
